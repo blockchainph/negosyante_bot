@@ -43,7 +43,11 @@ class ClaudeHandler:
             - If quantity is missing, default to 1.
             - If unit_price is unknown but line_total is clear, keep unit_price null.
             - If line_total is unknown but quantity and unit_price are known, line_total can be inferred by the app.
-            - For utang_record, include customer_name and line_items.
+            - For utang_record, include customer_name and line_items when available.
+            - For utang_record, if the user mentions a remaining unpaid amount such as "kulang", "remaining", "balance", "still owes", or "only has 15 so kulang 50",
+              set outstanding_amount to that unpaid balance.
+            - For utang_record, if both full sale amount and paid amount are mentioned, total_amount may be the full sale amount and outstanding_amount should be the unpaid balance to store.
+            - For quick utang entries like "utang allan 50", line_items may be empty and outstanding_amount should be 50.
             - For payment_record, include customer_name and total_amount.
             - For balance_query, include customer_name when the user asks about one person only.
             - For summary requests, set period to one of: today, week, month.
@@ -64,6 +68,8 @@ class ClaudeHandler:
                 }
               ],
               "total_amount": 0,
+              "amount_paid": 0,
+              "outstanding_amount": 0,
               "customer_name": "string or null",
               "item_name": "string or null",
               "unit_price": 0,
@@ -114,6 +120,8 @@ class ClaudeHandler:
             else "unknown",
             "line_items": line_items,
             "total_amount": self._safe_number(result.get("total_amount")),
+            "amount_paid": self._safe_number(result.get("amount_paid")),
+            "outstanding_amount": self._safe_number(result.get("outstanding_amount")),
             "customer_name": self._clean_string(result.get("customer_name")),
             "item_name": self._clean_string(result.get("item_name")),
             "unit_price": self._safe_number(result.get("unit_price")),

@@ -280,11 +280,15 @@ async def process_sale_like_intent(
         return False
 
     customer_name = parsed.get("customer_name")
+    outstanding_amount = parsed.get("outstanding_amount")
     if is_utang and not customer_name:
         await message.reply_text("Please tell me who the utang is for, like `utang kay ana: 2 coke 20`.")
         return False
 
     prepared_items, missing_items = db.prepare_sale_items(user.id, parsed["line_items"])
+    if is_utang and outstanding_amount is not None and outstanding_amount > 0 and missing_items:
+        prepared_items = []
+        missing_items = []
     if missing_items:
         context.user_data["pending_action"] = {
             "type": "missing_price",
@@ -308,6 +312,24 @@ async def process_sale_like_intent(
         return False
 
     if not prepared_items:
+        if is_utang and outstanding_amount is not None and outstanding_amount > 0:
+            sale = db.save_utang_sale(
+                telegram_user_id=user.id,
+                telegram_username=user.username,
+                customer_name=customer_name,
+                line_items=[],
+                total_amount=outstanding_amount,
+                currency=parsed.get("currency") or "PHP",
+                raw_message=raw_message,
+            )
+            db.log_event(
+                user.id,
+                "utang_recorded",
+                message_text=raw_message,
+                metadata={"customer_name": sale["customer_name"], "total_amount": float(sale["total_amount"]), "balance_only": True},
+            )
+            await message.reply_text(format_utang_sale_message(sale))
+            return True
         await message.reply_text(
             "Please send at least one utang item, like `utang kay ana: 2 coke 20`."
             if is_utang
@@ -317,12 +339,13 @@ async def process_sale_like_intent(
 
     total_amount = parsed.get("total_amount") or sum(item["line_total"] for item in prepared_items)
     if is_utang:
+        stored_amount = outstanding_amount if outstanding_amount is not None and outstanding_amount > 0 else total_amount
         sale = db.save_utang_sale(
             telegram_user_id=user.id,
             telegram_username=user.username,
             customer_name=customer_name,
             line_items=prepared_items,
-            total_amount=total_amount,
+            total_amount=stored_amount,
             currency=parsed.get("currency") or "PHP",
             raw_message=raw_message,
         )
@@ -330,7 +353,7 @@ async def process_sale_like_intent(
             user.id,
             "utang_recorded",
             message_text=raw_message,
-            metadata={"customer_name": sale["customer_name"], "total_amount": float(sale["total_amount"])},
+            metadata={"customer_name": sale["customer_name"], "total_amount": float(sale["total_amount"]), "sale_total": float(total_amount)},
         )
         await message.reply_text(format_utang_sale_message(sale))
         for warning in sale.get("stock_warnings", []):
@@ -600,14 +623,15 @@ def format_low_stock_warning(warning: dict[str, object]) -> str:
 
 
 def format_utang_sale_message(sale: dict[str, object]) -> str:
-    lines = [
-        f"Saved utang for {sale['customer_name']}: {format_money(sale['total_amount'], sale['currency'])}",
-        "Items:",
-    ]
-    for item in sale["line_items"]:
-        lines.append(
-            f"- {item['item_name']}: {int(item['quantity'])} x {format_money(item['unit_price'], sale['currency'])} = {format_money(item['line_total'], sale['currency'])}"
-        )
+    lines = [f"Saved utang for {sale['customer_name']}: {format_money(sale['total_amount'], sale['currency'])}"]
+    if sale["line_items"]:
+        lines.append("Items:")
+        for item in sale["line_items"]:
+            lines.append(
+                f"- {item['item_name']}: {int(item['quantity'])} x {format_money(item['unit_price'], sale['currency'])} = {format_money(item['line_total'], sale['currency'])}"
+            )
+    else:
+        lines.append("Recorded as balance only.")
     lines.append(f"Remaining balance: {format_money(sale['remaining_balance'], sale['currency'])}")
     return "\n".join(lines)
 

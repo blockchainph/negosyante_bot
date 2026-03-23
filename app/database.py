@@ -143,7 +143,8 @@ class Database:
                     "line_total": round(float(item["line_total"]), 2),
                 }
             )
-        self.client.table(self.utang_line_items_table).insert(prepared_items).execute()
+        if prepared_items:
+            self.client.table(self.utang_line_items_table).insert(prepared_items).execute()
         stock_warnings = self._decrement_stock_and_collect_warnings(telegram_user_id, line_items)
         sale["line_items"] = prepared_items
         sale["customer"] = customer
