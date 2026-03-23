@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
+from typing import Any
 
 from telegram import BotCommand, Update
 from telegram.constants import ChatAction
@@ -127,6 +129,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = message.text.strip()
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
 
+    if await resume_pending_action(update, context, text):
+        return
+
     try:
         parsed = await claude.parse_message(text)
     except Exception:
@@ -136,69 +141,36 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if parsed["needs_clarification"]:
+        pending_action = build_pending_action_from_parsed(parsed, text)
+        if pending_action:
+            context.user_data["pending_action"] = pending_action
         db.log_event(user.id, "clarification_requested", message_text=text, metadata={"intent": parsed["intent"]})
         await message.reply_text(parsed["clarification_message"] or "I need a bit more detail before I record that sale.")
         return
 
     intent = parsed["intent"]
     if intent == "sale_record":
-        prepared_items, missing_items = db.prepare_sale_items(user.id, parsed["line_items"])
-        if missing_items:
-            missing_text = ", ".join(missing_items)
-            await message.reply_text(
-                f"I still need prices for: {missing_text}. Set them first with messages like `set price coke 20`, or include the prices in the sale message.",
-                parse_mode="Markdown",
-            )
-            return
-        if not prepared_items:
-            await message.reply_text("Please send at least one sale item, like `2 coke 20 and 1 bread 45`.")
-            return
-
-        total_amount = parsed.get("total_amount") or sum(item["line_total"] for item in prepared_items)
-        transaction = db.save_sale(
-            telegram_user_id=user.id,
-            telegram_username=user.username,
-            line_items=prepared_items,
-            total_amount=total_amount,
-            currency=parsed.get("currency") or "PHP",
+        success = await process_sale_like_intent(
+            update=update,
+            context=context,
+            parsed=parsed,
             raw_message=text,
+            is_utang=False,
         )
-        db.log_event(user.id, "sale_recorded", message_text=text, metadata={"total_amount": float(transaction["total_amount"])})
-        await message.reply_text(format_sale_saved_message(transaction))
-        for warning in transaction.get("stock_warnings", []):
-            await message.reply_text(format_low_stock_warning(warning))
+        if success:
+            context.user_data.pop("pending_action", None)
         return
 
     if intent == "utang_record":
-        customer_name = parsed.get("customer_name")
-        if not customer_name:
-            await message.reply_text("Please tell me who the utang is for, like `utang kay ana: 2 coke 20`.")
-            return
-        prepared_items, missing_items = db.prepare_sale_items(user.id, parsed["line_items"])
-        if missing_items:
-            missing_text = ", ".join(missing_items)
-            await message.reply_text(
-                f"I still need prices for: {missing_text}. Set them first with messages like `set price coke 20`, or include the prices in the utang message.",
-                parse_mode="Markdown",
-            )
-            return
-        if not prepared_items:
-            await message.reply_text("Please send at least one utang item, like `utang kay ana: 2 coke 20`.")
-            return
-        total_amount = parsed.get("total_amount") or sum(item["line_total"] for item in prepared_items)
-        sale = db.save_utang_sale(
-            telegram_user_id=user.id,
-            telegram_username=user.username,
-            customer_name=customer_name,
-            line_items=prepared_items,
-            total_amount=total_amount,
-            currency=parsed.get("currency") or "PHP",
+        success = await process_sale_like_intent(
+            update=update,
+            context=context,
+            parsed=parsed,
             raw_message=text,
+            is_utang=True,
         )
-        db.log_event(user.id, "utang_recorded", message_text=text, metadata={"customer_name": sale["customer_name"], "total_amount": float(sale["total_amount"])})
-        await message.reply_text(format_utang_sale_message(sale))
-        for warning in sale.get("stock_warnings", []):
-            await message.reply_text(format_low_stock_warning(warning))
+        if success:
+            context.user_data.pop("pending_action", None)
         return
 
     if intent == "payment_record":
@@ -290,6 +262,256 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     await message.reply_text(
         "I can record sales, manage prices, track stock, and handle utang. Try `3 coke 20, 1 bread 45`, `utang kay ana: 2 coke 20`, or `ana paid 100`."
     )
+
+
+async def process_sale_like_intent(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    parsed: dict[str, Any],
+    raw_message: str,
+    *,
+    is_utang: bool,
+) -> bool:
+    db: Database = context.application.bot_data["db"]
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return False
+
+    customer_name = parsed.get("customer_name")
+    if is_utang and not customer_name:
+        await message.reply_text("Please tell me who the utang is for, like `utang kay ana: 2 coke 20`.")
+        return False
+
+    prepared_items, missing_items = db.prepare_sale_items(user.id, parsed["line_items"])
+    if missing_items:
+        context.user_data["pending_action"] = {
+            "type": "missing_price",
+            "intent": "utang_record" if is_utang else "sale_record",
+            "customer_name": customer_name,
+            "line_items": parsed["line_items"],
+            "currency": parsed.get("currency") or "PHP",
+            "raw_message": raw_message,
+            "missing_items": missing_items,
+        }
+        missing_text = ", ".join(missing_items)
+        if len(missing_items) == 1:
+            await message.reply_text(
+                f"What is the unit price of {missing_items[0]}? You can reply with just the amount, like `2 pesos`."
+            )
+        else:
+            await message.reply_text(
+                f"I still need prices for: {missing_text}. Reply one at a time like `odong 2` or set them with `set price odong 2`.",
+                parse_mode="Markdown",
+            )
+        return False
+
+    if not prepared_items:
+        await message.reply_text(
+            "Please send at least one utang item, like `utang kay ana: 2 coke 20`."
+            if is_utang
+            else "Please send at least one sale item, like `2 coke 20 and 1 bread 45`."
+        )
+        return False
+
+    total_amount = parsed.get("total_amount") or sum(item["line_total"] for item in prepared_items)
+    if is_utang:
+        sale = db.save_utang_sale(
+            telegram_user_id=user.id,
+            telegram_username=user.username,
+            customer_name=customer_name,
+            line_items=prepared_items,
+            total_amount=total_amount,
+            currency=parsed.get("currency") or "PHP",
+            raw_message=raw_message,
+        )
+        db.log_event(
+            user.id,
+            "utang_recorded",
+            message_text=raw_message,
+            metadata={"customer_name": sale["customer_name"], "total_amount": float(sale["total_amount"])},
+        )
+        await message.reply_text(format_utang_sale_message(sale))
+        for warning in sale.get("stock_warnings", []):
+            await message.reply_text(format_low_stock_warning(warning))
+    else:
+        transaction = db.save_sale(
+            telegram_user_id=user.id,
+            telegram_username=user.username,
+            line_items=prepared_items,
+            total_amount=total_amount,
+            currency=parsed.get("currency") or "PHP",
+            raw_message=raw_message,
+        )
+        db.log_event(
+            user.id,
+            "sale_recorded",
+            message_text=raw_message,
+            metadata={"total_amount": float(transaction["total_amount"])},
+        )
+        await message.reply_text(format_sale_saved_message(transaction))
+        for warning in transaction.get("stock_warnings", []):
+            await message.reply_text(format_low_stock_warning(warning))
+    return True
+
+
+async def resume_pending_action(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+) -> bool:
+    pending = context.user_data.get("pending_action")
+    if not pending:
+        return False
+
+    pending_type = pending.get("type")
+    if pending_type == "summary_period":
+        return await resolve_summary_period_follow_up(update, context, text, pending)
+    if pending_type == "missing_price":
+        return await resolve_missing_price_follow_up(update, context, text, pending)
+    return False
+
+
+def build_pending_action_from_parsed(parsed: dict[str, Any], raw_message: str) -> dict[str, Any] | None:
+    if parsed["intent"] == "revenue_summary":
+        return {"type": "summary_period", "raw_message": raw_message}
+    if parsed["intent"] in {"sale_record", "utang_record"} and parsed.get("line_items"):
+        return {
+            "type": "missing_price",
+            "intent": parsed["intent"],
+            "customer_name": parsed.get("customer_name"),
+            "line_items": parsed["line_items"],
+            "currency": parsed.get("currency") or "PHP",
+            "raw_message": raw_message,
+        }
+    return None
+
+
+async def resolve_summary_period_follow_up(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    pending: dict[str, Any],
+) -> bool:
+    db: Database = context.application.bot_data["db"]
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return False
+
+    period = detect_period(text)
+    if not period:
+        if text.strip().lower() in {"yes", "y", "ok", "okay", "sige"}:
+            period = "today"
+        else:
+            await message.reply_text("Please reply with `today`, `week`, or `month`.")
+            return True
+
+    context.user_data.pop("pending_action", None)
+    summary = db.get_revenue_summary(user.id, period, now=datetime.now(timezone.utc))
+    db.log_event(user.id, "revenue_summary_requested", message_text=pending.get("raw_message"), metadata={"period": period, "follow_up": True})
+    await message.reply_text(format_revenue_summary(summary))
+    return True
+
+
+async def resolve_missing_price_follow_up(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    pending: dict[str, Any],
+) -> bool:
+    message = update.effective_message
+    if not message:
+        return False
+
+    line_items = [dict(item) for item in pending.get("line_items", [])]
+    unresolved = [
+        item for item in line_items
+        if item.get("unit_price") in (None, "", 0) and item.get("line_total") in (None, "", 0)
+    ]
+    if not unresolved:
+        context.user_data.pop("pending_action", None)
+        return False
+
+    target_item = choose_pending_item(unresolved, text)
+    amount = extract_first_amount(text)
+    if not target_item or amount is None or amount <= 0:
+        if len(unresolved) == 1:
+            await message.reply_text(f"Reply with the price for {unresolved[0]['item_name']}, like `2 pesos`.")
+        else:
+            names = ", ".join(item["item_name"] for item in unresolved)
+            await message.reply_text(f"I still need prices for: {names}. Reply one at a time like `odong 2`.")
+        return True
+
+    for item in line_items:
+        if item["item_name"] == target_item["item_name"]:
+            quantity = float(item.get("quantity") or 1)
+            item["unit_price"] = amount
+            item["line_total"] = round(quantity * amount, 2)
+            break
+
+    parsed = {
+        "intent": pending["intent"],
+        "line_items": line_items,
+        "total_amount": sum(float(item.get("line_total") or 0) for item in line_items),
+        "customer_name": pending.get("customer_name"),
+        "currency": pending.get("currency") or "PHP",
+    }
+
+    unresolved_after = [
+        item for item in line_items
+        if item.get("unit_price") in (None, "", 0) and item.get("line_total") in (None, "", 0)
+    ]
+    if unresolved_after:
+        context.user_data["pending_action"] = {
+            **pending,
+            "line_items": line_items,
+            "missing_items": [item["item_name"] for item in unresolved_after],
+        }
+    else:
+        context.user_data.pop("pending_action", None)
+
+    success = await process_sale_like_intent(
+        update=update,
+        context=context,
+        parsed=parsed,
+        raw_message=f"{pending.get('raw_message', '')} | follow-up: {text}",
+        is_utang=pending["intent"] == "utang_record",
+    )
+    if success:
+        context.user_data.pop("pending_action", None)
+    return True
+
+
+def detect_period(text: str) -> str | None:
+    lowered = text.lower()
+    if "today" in lowered or "daily" in lowered:
+        return "today"
+    if "week" in lowered or "weekly" in lowered:
+        return "week"
+    if "month" in lowered or "monthly" in lowered:
+        return "month"
+    return None
+
+
+def extract_first_amount(text: str) -> float | None:
+    match = re.search(r"(\d+(?:\.\d+)?)", text.replace(",", ""))
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def choose_pending_item(unresolved: list[dict[str, Any]], text: str) -> dict[str, Any] | None:
+    lowered = text.lower()
+    for item in unresolved:
+        if item["item_name"].lower() in lowered:
+            return item
+    if len(unresolved) == 1:
+        return unresolved[0]
+    return None
 
 
 async def track_user_context(
