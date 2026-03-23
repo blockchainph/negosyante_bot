@@ -133,6 +133,23 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if await resume_pending_action(update, context, text):
         return
 
+    direct_payment = parse_direct_payment_message(text)
+    if direct_payment:
+        payment = db.record_utang_payment(
+            telegram_user_id=user.id,
+            customer_name=direct_payment["customer_name"],
+            amount=direct_payment["amount"],
+            currency="PHP",
+        )
+        db.log_event(
+            user.id,
+            "utang_payment_recorded",
+            message_text=text,
+            metadata={"customer_name": payment["customer_name"], "amount": float(payment["amount"]), "direct_match": True},
+        )
+        await message.reply_text(format_utang_payment_message(payment))
+        return
+
     try:
         parsed = await claude.parse_message(text)
     except Exception:
@@ -536,6 +553,24 @@ def choose_pending_item(unresolved: list[dict[str, Any]], text: str) -> dict[str
     if len(unresolved) == 1:
         return unresolved[0]
     return None
+
+
+def parse_direct_payment_message(text: str) -> dict[str, Any] | None:
+    match = re.match(
+        r"^\s*([A-Za-z][A-Za-z0-9 _.-]{0,49}?)\s+paid\s+(\d+(?:\.\d+)?)\s*(?:pesos?|php)?\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    customer_name = match.group(1).strip()
+    try:
+        amount = float(match.group(2))
+    except ValueError:
+        return None
+    if amount <= 0:
+        return None
+    return {"customer_name": customer_name, "amount": amount}
 
 
 async def track_user_context(
