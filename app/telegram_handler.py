@@ -57,7 +57,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "`weekly revenue`\n"
         "`top selling items this month`\n"
         "`set price coke 20`\n"
-        "`set stock coke 24 reorder 6`"
+        "`set stock coke 24 reorder 6`\n"
+        "`utang kay ana: 2 coke 20, 1 bread 45`\n"
+        "`ana paid 100`\n"
+        "`how much utang ni ana`"
     )
     await update.effective_message.reply_text(message, parse_mode="Markdown")
 
@@ -65,7 +68,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = (
         "This bot records sari-sari store sales, keeps a price list per owner, and tracks revenue by day, week, and month.\n\n"
-        "It can also show top-selling items and warn you when stock falls below your reorder level."
+        "It can also show top-selling items, track utang balances, and warn you when stock falls below your reorder level."
     )
     await update.effective_message.reply_text(message)
 
@@ -141,6 +144,62 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await message.reply_text(format_low_stock_warning(warning))
         return
 
+    if intent == "utang_record":
+        customer_name = parsed.get("customer_name")
+        if not customer_name:
+            await message.reply_text("Please tell me who the utang is for, like `utang kay ana: 2 coke 20`.")
+            return
+        prepared_items, missing_items = db.prepare_sale_items(user.id, parsed["line_items"])
+        if missing_items:
+            missing_text = ", ".join(missing_items)
+            await message.reply_text(
+                f"I still need prices for: {missing_text}. Set them first with messages like `set price coke 20`, or include the prices in the utang message.",
+                parse_mode="Markdown",
+            )
+            return
+        if not prepared_items:
+            await message.reply_text("Please send at least one utang item, like `utang kay ana: 2 coke 20`.")
+            return
+        total_amount = parsed.get("total_amount") or sum(item["line_total"] for item in prepared_items)
+        sale = db.save_utang_sale(
+            telegram_user_id=user.id,
+            telegram_username=user.username,
+            customer_name=customer_name,
+            line_items=prepared_items,
+            total_amount=total_amount,
+            currency=parsed.get("currency") or "PHP",
+            raw_message=text,
+        )
+        await message.reply_text(format_utang_sale_message(sale))
+        for warning in sale.get("stock_warnings", []):
+            await message.reply_text(format_low_stock_warning(warning))
+        return
+
+    if intent == "payment_record":
+        customer_name = parsed.get("customer_name")
+        total_amount = parsed.get("total_amount")
+        if not customer_name or total_amount is None or total_amount <= 0:
+            await message.reply_text("Please send a payment like `ana paid 100`.")
+            return
+        payment = db.record_utang_payment(
+            telegram_user_id=user.id,
+            customer_name=customer_name,
+            amount=total_amount,
+            currency=parsed.get("currency") or "PHP",
+        )
+        await message.reply_text(format_utang_payment_message(payment))
+        return
+
+    if intent == "balance_query":
+        customer_name = parsed.get("customer_name")
+        if customer_name:
+            balance = db.get_customer_balance(user.id, customer_name)
+            await message.reply_text(format_customer_balance(balance))
+            return
+        balances = db.get_all_balances(user.id)
+        await message.reply_text(format_all_balances(balances))
+        return
+
     if intent == "revenue_summary":
         summary = db.get_revenue_summary(user.id, parsed.get("period") or "today", now=datetime.now(timezone.utc))
         await message.reply_text(format_revenue_summary(summary))
@@ -189,7 +248,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     await message.reply_text(
-        "I can record sales, manage prices, track stock, and show revenue summaries. Try `3 coke 20, 1 bread 45` or `set price coke 20`."
+        "I can record sales, manage prices, track stock, and handle utang. Try `3 coke 20, 1 bread 45`, `utang kay ana: 2 coke 20`, or `ana paid 100`."
     )
 
 
@@ -252,6 +311,44 @@ def format_low_stock_warning(warning: dict[str, object]) -> str:
         f"Low stock warning: {warning['item_name']} is now at {warning['stock_quantity']} "
         f"which is at or below the reorder level of {warning['reorder_level']}."
     )
+
+
+def format_utang_sale_message(sale: dict[str, object]) -> str:
+    lines = [
+        f"Saved utang for {sale['customer_name']}: {format_money(sale['total_amount'], sale['currency'])}",
+        "Items:",
+    ]
+    for item in sale["line_items"]:
+        lines.append(
+            f"- {item['item_name']}: {int(item['quantity'])} x {format_money(item['unit_price'], sale['currency'])} = {format_money(item['line_total'], sale['currency'])}"
+        )
+    lines.append(f"Remaining balance: {format_money(sale['remaining_balance'], sale['currency'])}")
+    return "\n".join(lines)
+
+
+def format_utang_payment_message(payment: dict[str, object]) -> str:
+    return (
+        f"Recorded payment from {payment['customer_name']}: {format_money(payment['amount'], payment['currency'])}\n"
+        f"Remaining balance: {format_money(payment['remaining_balance'], payment['currency'])}"
+    )
+
+
+def format_customer_balance(balance: dict[str, object]) -> str:
+    return (
+        f"{balance['customer_name']}'s balance\n"
+        f"Total utang: {format_money(balance['total_sales'], balance['currency'])}\n"
+        f"Total paid: {format_money(balance['total_payments'], balance['currency'])}\n"
+        f"Remaining: {format_money(balance['balance'], balance['currency'])}"
+    )
+
+
+def format_all_balances(balances: list[dict[str, object]]) -> str:
+    if not balances:
+        return "No unpaid utang balances right now."
+    lines = ["Unpaid utang balances:"]
+    for balance in balances[:10]:
+        lines.append(f"- {balance['customer_name']}: {format_money(balance['balance'], balance['currency'])}")
+    return "\n".join(lines)
 
 
 def format_money(amount: float | int | str, currency: str) -> str:

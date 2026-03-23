@@ -19,6 +19,10 @@ class Database:
         self.sales_table = "sales_transactions"
         self.line_items_table = "sales_line_items"
         self.price_list_table = "price_list_items"
+        self.customers_table = "customers"
+        self.utang_sales_table = "utang_sales"
+        self.utang_line_items_table = "utang_line_items"
+        self.utang_payments_table = "utang_payments"
 
     def save_sale(
         self,
@@ -55,6 +59,129 @@ class Database:
         transaction["line_items"] = prepared_items
         transaction["stock_warnings"] = stock_warnings
         return transaction
+
+    def get_or_create_customer(self, telegram_user_id: int, customer_name: str) -> dict[str, Any]:
+        normalized_name = customer_name.strip().lower()
+        existing = (
+            self.client.table(self.customers_table)
+            .select("*")
+            .eq("telegram_user_id", telegram_user_id)
+            .eq("customer_name", normalized_name)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            return existing.data[0]
+        payload = {
+            "telegram_user_id": telegram_user_id,
+            "customer_name": normalized_name,
+        }
+        return self.client.table(self.customers_table).insert(payload).execute().data[0]
+
+    def save_utang_sale(
+        self,
+        telegram_user_id: int,
+        telegram_username: str | None,
+        customer_name: str,
+        line_items: list[dict[str, Any]],
+        total_amount: float,
+        currency: str,
+        raw_message: str | None = None,
+    ) -> dict[str, Any]:
+        customer = self.get_or_create_customer(telegram_user_id, customer_name)
+        sale_payload = {
+            "telegram_user_id": telegram_user_id,
+            "telegram_username": telegram_username,
+            "customer_id": customer["id"],
+            "customer_name": customer["customer_name"],
+            "total_amount": round(float(total_amount), 2),
+            "currency": currency or "PHP",
+            "raw_message": raw_message,
+        }
+        sale = self.client.table(self.utang_sales_table).insert(sale_payload).execute().data[0]
+        prepared_items: list[dict[str, Any]] = []
+        for item in line_items:
+            prepared_items.append(
+                {
+                    "utang_sale_id": sale["id"],
+                    "item_name": item["item_name"],
+                    "quantity": int(item["quantity"]),
+                    "unit_price": round(float(item["unit_price"]), 2),
+                    "line_total": round(float(item["line_total"]), 2),
+                }
+            )
+        self.client.table(self.utang_line_items_table).insert(prepared_items).execute()
+        stock_warnings = self._decrement_stock_and_collect_warnings(telegram_user_id, line_items)
+        sale["line_items"] = prepared_items
+        sale["customer"] = customer
+        sale["stock_warnings"] = stock_warnings
+        sale["remaining_balance"] = self.get_customer_balance(telegram_user_id, customer["customer_name"])["balance"]
+        return sale
+
+    def record_utang_payment(
+        self,
+        telegram_user_id: int,
+        customer_name: str,
+        amount: float,
+        currency: str = "PHP",
+    ) -> dict[str, Any]:
+        customer = self.get_or_create_customer(telegram_user_id, customer_name)
+        payload = {
+            "telegram_user_id": telegram_user_id,
+            "customer_id": customer["id"],
+            "customer_name": customer["customer_name"],
+            "amount": round(float(amount), 2),
+            "currency": currency or "PHP",
+        }
+        payment = self.client.table(self.utang_payments_table).insert(payload).execute().data[0]
+        payment["remaining_balance"] = self.get_customer_balance(telegram_user_id, customer["customer_name"])["balance"]
+        return payment
+
+    def get_customer_balance(
+        self,
+        telegram_user_id: int,
+        customer_name: str,
+    ) -> dict[str, Any]:
+        normalized_name = customer_name.strip().lower()
+        sales = (
+            self.client.table(self.utang_sales_table)
+            .select("total_amount,currency")
+            .eq("telegram_user_id", telegram_user_id)
+            .eq("customer_name", normalized_name)
+            .execute()
+        ).data or []
+        payments = (
+            self.client.table(self.utang_payments_table)
+            .select("amount,currency")
+            .eq("telegram_user_id", telegram_user_id)
+            .eq("customer_name", normalized_name)
+            .execute()
+        ).data or []
+        total_sales = sum(self._safe_amount(row.get("total_amount")) for row in sales)
+        total_payments = sum(self._safe_amount(row.get("amount")) for row in payments)
+        currency = sales[0]["currency"] if sales else payments[0]["currency"] if payments else "PHP"
+        return {
+            "customer_name": normalized_name,
+            "balance": round(total_sales - total_payments, 2),
+            "total_sales": round(total_sales, 2),
+            "total_payments": round(total_payments, 2),
+            "currency": currency,
+        }
+
+    def get_all_balances(self, telegram_user_id: int) -> list[dict[str, Any]]:
+        customers = (
+            self.client.table(self.customers_table)
+            .select("customer_name")
+            .eq("telegram_user_id", telegram_user_id)
+            .order("customer_name", desc=False)
+            .execute()
+        ).data or []
+        balances: list[dict[str, Any]] = []
+        for customer in customers:
+            balance = self.get_customer_balance(telegram_user_id, customer["customer_name"])
+            if balance["balance"] > 0:
+                balances.append(balance)
+        return sorted(balances, key=lambda row: row["balance"], reverse=True)
 
     def upsert_price_list_item(
         self,

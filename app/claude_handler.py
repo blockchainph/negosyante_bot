@@ -25,6 +25,9 @@ class ClaudeHandler:
 
             Supported intents:
             - sale_record: user is logging one sale with one or more line items
+            - utang_record: user is logging a credit sale for a named customer
+            - payment_record: user is logging a payment toward utang
+            - balance_query: user wants a customer's remaining utang or a list of unpaid balances
             - revenue_summary: user wants daily, weekly, or monthly sales summary
             - top_items: user wants top-selling items
             - price_set: user wants to set or update the price of an item
@@ -40,6 +43,9 @@ class ClaudeHandler:
             - If quantity is missing, default to 1.
             - If unit_price is unknown but line_total is clear, keep unit_price null.
             - If line_total is unknown but quantity and unit_price are known, line_total can be inferred by the app.
+            - For utang_record, include customer_name and line_items.
+            - For payment_record, include customer_name and total_amount.
+            - For balance_query, include customer_name when the user asks about one person only.
             - For summary requests, set period to one of: today, week, month.
             - If period is unclear, default to today for revenue_summary and month for top_items.
             - For price_set, use item_name plus unit_price.
@@ -48,7 +54,7 @@ class ClaudeHandler:
 
             Return this exact JSON shape:
             {
-              "intent": "sale_record|revenue_summary|top_items|price_set|price_show|stock_update|unknown",
+              "intent": "sale_record|utang_record|payment_record|balance_query|revenue_summary|top_items|price_set|price_show|stock_update|unknown",
               "line_items": [
                 {
                   "item_name": "string",
@@ -58,6 +64,7 @@ class ClaudeHandler:
                 }
               ],
               "total_amount": 0,
+              "customer_name": "string or null",
               "item_name": "string or null",
               "unit_price": 0,
               "stock_quantity": 0,
@@ -103,10 +110,11 @@ class ClaudeHandler:
 
         return {
             "intent": intent
-            if intent in {"sale_record", "revenue_summary", "top_items", "price_set", "price_show", "stock_update", "unknown"}
+            if intent in {"sale_record", "utang_record", "payment_record", "balance_query", "revenue_summary", "top_items", "price_set", "price_show", "stock_update", "unknown"}
             else "unknown",
             "line_items": line_items,
             "total_amount": self._safe_number(result.get("total_amount")),
+            "customer_name": self._clean_string(result.get("customer_name")),
             "item_name": self._clean_string(result.get("item_name")),
             "unit_price": self._safe_number(result.get("unit_price")),
             "stock_quantity": self._safe_number(result.get("stock_quantity")),
