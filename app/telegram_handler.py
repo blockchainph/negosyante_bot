@@ -54,6 +54,7 @@ async def post_init(application: Application) -> None:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await track_user_context(update, context, event_type="start_command")
     message = (
+        "Created by @FerdieCPS\n\n"
         "Send sales naturally, like:\n"
         "`3 coke 20, 2 lucky me 15, 1 soap 35`\n"
         "`sold 2 alaska 35 each and 1 bread 45`\n\n"
