@@ -1,0 +1,1 @@
+"""Telegram finance tracker package."""
