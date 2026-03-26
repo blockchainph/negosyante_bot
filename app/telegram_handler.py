@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from telegram import BotCommand, Update
@@ -131,6 +131,18 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
 
     if await resume_pending_action(update, context, text):
+        return
+
+    custom_summary_date = parse_custom_summary_date(text, db.local_timezone)
+    if custom_summary_date is not None:
+        summary = db.get_revenue_summary_for_date(user.id, custom_summary_date)
+        db.log_event(
+            user.id,
+            "revenue_summary_requested",
+            message_text=text,
+            metadata={"period": "custom_day", "date": custom_summary_date.isoformat(), "direct_match": True},
+        )
+        await message.reply_text(format_revenue_summary(summary))
         return
 
     direct_payment = parse_direct_payment_message(text)
@@ -571,6 +583,82 @@ def parse_direct_payment_message(text: str) -> dict[str, Any] | None:
     if amount <= 0:
         return None
     return {"customer_name": customer_name, "amount": amount}
+
+
+def parse_custom_summary_date(text: str, local_timezone) -> date | None:
+    lowered = text.lower().strip()
+    if not any(keyword in lowered for keyword in ("summary", "sales", "revenue")):
+        return None
+    if any(keyword in lowered for keyword in ("today", "week", "weekly", "month", "monthly")):
+        return None
+
+    now_local = datetime.now(local_timezone).date()
+
+    if "yesterday" in lowered:
+        return now_local - timedelta(days=1)
+
+    days_ago_match = re.search(r"(\d+)\s+days?\s+ago", lowered)
+    if days_ago_match:
+        return now_local - timedelta(days=int(days_ago_match.group(1)))
+
+    iso_match = re.search(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", lowered)
+    if iso_match:
+        try:
+            return date(int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3)))
+        except ValueError:
+            return None
+
+    slash_match = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", lowered)
+    if slash_match:
+        month = int(slash_match.group(1))
+        day = int(slash_match.group(2))
+        year_text = slash_match.group(3)
+        year = now_local.year if not year_text else int(year_text)
+        if year < 100:
+            year += 2000
+        try:
+            return date(year, month, day)
+        except ValueError:
+            return None
+
+    month_names = {
+        "january": 1,
+        "jan": 1,
+        "february": 2,
+        "feb": 2,
+        "march": 3,
+        "mar": 3,
+        "april": 4,
+        "apr": 4,
+        "may": 5,
+        "june": 6,
+        "jun": 6,
+        "july": 7,
+        "jul": 7,
+        "august": 8,
+        "aug": 8,
+        "september": 9,
+        "sep": 9,
+        "sept": 9,
+        "october": 10,
+        "oct": 10,
+        "november": 11,
+        "nov": 11,
+        "december": 12,
+        "dec": 12,
+    }
+    month_pattern = "|".join(sorted(month_names.keys(), key=len, reverse=True))
+    named_match = re.search(rf"\b({month_pattern})\s+(\d{{1,2}})(?:,\s*(\d{{4}}))?\b", lowered)
+    if named_match:
+        month = month_names[named_match.group(1)]
+        day = int(named_match.group(2))
+        year = int(named_match.group(3)) if named_match.group(3) else now_local.year
+        try:
+            return date(year, month, day)
+        except ValueError:
+            return None
+
+    return None
 
 
 async def track_user_context(

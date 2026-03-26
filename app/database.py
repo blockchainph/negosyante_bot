@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -382,6 +382,27 @@ class Database:
         return {
             "label": label,
             "period": period,
+            "count": len(transactions),
+            "total": round(total, 2),
+            "currency": transactions[0]["currency"] if transactions else "PHP",
+        }
+
+    def get_revenue_summary_for_date(
+        self,
+        telegram_user_id: int,
+        target_date: date,
+    ) -> dict[str, Any]:
+        start_local = datetime(target_date.year, target_date.month, target_date.day, tzinfo=self.local_timezone)
+        end_local = start_local + timedelta(days=1) - timedelta(seconds=1)
+        transactions = self._get_sales_between(
+            telegram_user_id,
+            start_local.astimezone(timezone.utc),
+            end_local.astimezone(timezone.utc),
+        )
+        total = sum(self._safe_amount(row.get("total_amount")) for row in transactions)
+        return {
+            "label": target_date.strftime("%b %d, %Y"),
+            "period": "custom_day",
             "count": len(transactions),
             "total": round(total, 2),
             "currency": transactions[0]["currency"] if transactions else "PHP",
